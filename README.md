@@ -1,6 +1,6 @@
 # Project Manager API
 
-Small REST API for managing projects and their members (Django + DRF + PostgreSQL, JWT auth).
+Small REST API for managing projects and their members (Django 3.2 + DRF + PostgreSQL, JWT auth). Use Python 3.8-3.10..
 
 ## Setup
 
