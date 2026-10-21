@@ -1,36 +1,24 @@
-from django.db import IntegrityError, transaction
-from django.shortcuts import get_object_or_404
 from rest_framework import generics, status
-from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 
-from .models import Project, ProjectMember
+from . import services
 from .permissions import ProjectPermission
+from .roles import Role, at_least
 from .serializers import AddMemberSerializer, ProjectMemberSerializer, ProjectSerializer
-
-Role = ProjectMember.Role
-
-
-class LastOwnerError(APIException):
-
-    status_code = status.HTTP_409_CONFLICT
-    default_detail = "A project must always keep at least one owner."
-    default_code = "last_owner"
 
 
 class ProjectListCreateView(generics.ListCreateAPIView):
     serializer_class = ProjectSerializer
 
     def get_queryset(self):
+        return services.projects_for_user(self.request.user)
 
-        return Project.objects.filter(members__user=self.request.user)
-
- 
-    @transaction.atomic
     def perform_create(self, serializer):
-        project = serializer.save()
-   
-        ProjectMember.objects.create(project=project, user=self.request.user, role=Role.OWNER)
+        # Creator becomes owner (atomic, inside service)
+        serializer.instance = services.create_project(
+            owner=self.request.user, **serializer.validated_data
+        )
 
 
 class ProjectDetailView(generics.RetrieveUpdateDestroyAPIView):
@@ -38,78 +26,40 @@ class ProjectDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [ProjectPermission]
 
     def get_queryset(self):
- 
-        return Project.objects.filter(members__user=self.request.user)
-
-
-def get_my_membership(request, project_id):
-
-    return get_object_or_404(ProjectMember, project_id=project_id, user=request.user)
+        # Members only: outsiders get 404
+        return services.projects_for_user(self.request.user)
 
 
 class MemberListCreateView(generics.ListCreateAPIView):
     serializer_class = ProjectMemberSerializer
 
     def get_queryset(self):
- 
-        get_my_membership(self.request, self.kwargs["project_id"])
- 
-        return ProjectMember.objects.filter(
-            project_id=self.kwargs["project_id"]
-        ).select_related("user")
-
+        return services.members_of(self.request.user, self.kwargs["project_id"])
 
     def create(self, request, *args, **kwargs):
-        me = get_my_membership(request, kwargs["project_id"])
-        if me.role not in (Role.OWNER, Role.ADMIN):
+        project_id = kwargs["project_id"]
+        me = services.get_membership(request.user, project_id)
+
+        # Authorize first, validate later (no user enumeration by non-managers)
+        if not at_least(me.role, Role.ADMIN):
             raise PermissionDenied("Only owners and admins can add members.")
 
         serializer = AddMemberSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = serializer.validated_data["phone_number"]  
-        role = serializer.validated_data["role"]
-
-
-        if me.role == Role.ADMIN and role != Role.MEMBER:
-            raise PermissionDenied("Admins can only add members with the member role.")
-
-
-        try:
-            with transaction.atomic():
-                member = ProjectMember.objects.create(
-                    project_id=kwargs["project_id"], user=user, role=role
-                )
-        except IntegrityError:
-            raise ValidationError({"phone_number": "This user is already a member."})
-
-        
+        member = services.add_member(
+            actor_role=me.role,
+            project_id=project_id,
+            user=serializer.validated_data["phone_number"],  # a User object
+            role=serializer.validated_data["role"],
+        )
         return Response(ProjectMemberSerializer(member).data, status=status.HTTP_201_CREATED)
 
 
 class MemberDeleteView(generics.DestroyAPIView):
-
     def destroy(self, request, *args, **kwargs):
-        project_id = kwargs["project_id"]
-
-
-        get_my_membership(request, project_id)
-
-
-        with transaction.atomic():
-            project = get_object_or_404(Project.objects.select_for_update(), pk=project_id)
-            me = get_object_or_404(ProjectMember, project=project, user=request.user)
-
-            target = get_object_or_404(ProjectMember, pk=kwargs["pk"], project=project)
-
-            if me.role not in (Role.OWNER, Role.ADMIN):
-                raise PermissionDenied("Only owners and admins can remove members.")
-            if me.role == Role.ADMIN and target.role != Role.MEMBER:
-                raise PermissionDenied("Admins can only remove regular members.")
-            if target.role == Role.OWNER:
-                owners = ProjectMember.objects.filter(project=project, role=Role.OWNER).count()
-                if owners <= 1:
-                    raise LastOwnerError()
-
-            target.delete()
-
+        services.remove_member(
+            actor=request.user,
+            project_id=kwargs["project_id"],
+            membership_id=kwargs["pk"],  # membership id, not user id
+        )
         return Response(status=status.HTTP_204_NO_CONTENT)
