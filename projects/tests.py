@@ -3,12 +3,14 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, connection
-from django.test import TransactionTestCase
+from django.test import SimpleTestCase, TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
 from .models import Project, ProjectMember
+from .roles import at_least, can_manage
 
 User = get_user_model()
 Role = ProjectMember.Role
@@ -86,11 +88,27 @@ class ProjectEndpointTests(BaseProjectTest):
     def test_list_contains_only_my_projects(self):
         other = make_project(self.outsider, name="Beta")
         self.login(self.owner)
-        ids = [p["id"] for p in self.client.get(reverse("project-list")).data]
+        ids = [p["id"] for p in self.client.get(reverse("project-list")).data["results"]]
         self.assertEqual(ids, [self.project.pk])
         self.login(self.outsider)
-        ids = [p["id"] for p in self.client.get(reverse("project-list")).data]
+        ids = [p["id"] for p in self.client.get(reverse("project-list")).data["results"]]
         self.assertEqual(ids, [other.pk])
+
+    def test_list_is_paginated(self):
+        self.login(self.owner)
+        data = self.client.get(reverse("project-list")).data
+        self.assertEqual(set(data), {"count", "next", "previous", "results"})
+
+    def test_list_query_count_is_constant(self):
+        self.login(self.owner)
+        url = reverse("project-list")
+        with CaptureQueriesContext(connection) as before:
+            self.client.get(url)
+        for i in range(5):
+            make_project(self.owner, name=f"Extra {i}")
+        with CaptureQueriesContext(connection) as after:
+            self.client.get(url)
+        self.assertEqual(len(before), len(after))
 
     def test_detail_reports_my_role(self):
         for user, role in [(self.owner, Role.OWNER), (self.admin, Role.ADMIN), (self.member, Role.MEMBER)]:
@@ -145,12 +163,22 @@ class MemberListTests(BaseProjectTest):
                 self.login(user)
                 response = self.client.get(self.members_url)
                 self.assertEqual(response.status_code, 200)
-                phones = sorted(m["phone_number"] for m in response.data)
+                phones = sorted(m["phone_number"] for m in response.data["results"])
                 self.assertEqual(phones, ["09120000001", "09120000002", "09120000003"])
 
     def test_outsider_gets_404(self):
         self.login(self.outsider)
         self.assertEqual(self.client.get(self.members_url).status_code, 404)
+
+    def test_query_count_is_constant(self):
+        self.login(self.owner)
+        with CaptureQueriesContext(connection) as before:
+            self.client.get(self.members_url)
+        for i in range(5):
+            add_member(self.project, make_user(f"0912999100{i}"), Role.MEMBER)
+        with CaptureQueriesContext(connection) as after:
+            self.client.get(self.members_url)
+        self.assertEqual(len(before), len(after))
 
 
 class MemberAddTests(BaseProjectTest):
@@ -357,3 +385,21 @@ class ConcurrentOwnerRemovalTests(TransactionTestCase):
         self.assertEqual(errors, [])
         self.assertEqual(owners_of(project), 1)
         self.assertEqual(results.count(204), 1)
+
+
+class RoleRuleTests(SimpleTestCase):
+    def test_can_manage_matrix(self):
+        o, a, m = Role.OWNER, Role.ADMIN, Role.MEMBER
+        expected = {
+            (o, o): True, (o, a): True, (o, m): True,
+            (a, o): False, (a, a): False, (a, m): True,
+            (m, o): False, (m, a): False, (m, m): False,
+        }
+        for (actor, target), allowed in expected.items():
+            with self.subTest(actor=actor, target=target):
+                self.assertEqual(can_manage(actor, target), allowed)
+
+    def test_at_least(self):
+        self.assertTrue(at_least("owner", "admin"))
+        self.assertTrue(at_least("admin", "admin"))
+        self.assertFalse(at_least("member", "admin"))
