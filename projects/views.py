@@ -1,6 +1,8 @@
 from rest_framework import generics, status
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+
 
 from . import services
 from .permissions import ProjectPermission
@@ -23,7 +25,7 @@ class ProjectListCreateView(generics.ListCreateAPIView):
 
 class ProjectDetailView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProjectSerializer
-    permission_classes = [ProjectPermission]
+    permission_classes = [IsAuthenticated, ProjectPermission]
 
     def get_queryset(self):
         # Members only: outsiders get 404
