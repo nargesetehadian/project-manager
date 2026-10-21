@@ -43,3 +43,43 @@ All are stored as `09123456789`.
 - Member: view project and members
 - Admin: edit project, add/remove regular members
 - Owner: everything, including deleting the project
+
+## Roles and the owner rule
+
+| Action | Member | Admin | Owner |
+|---|---|---|---|
+| View project and members | yes | yes | yes |
+| Edit project | no | yes | yes |
+| Delete project | no | no | yes |
+| Add member | no | role `member` only | any role |
+| Remove member | no | role `member` only | any member |
+
+**Invariant: a project always has at least one owner.**
+
+- The creator becomes the first owner automatically.
+- Owners may promote others to owner, so several owners can exist.
+- An owner may be removed (or leave) only while another owner remains.
+  Removing the last owner returns `409 Conflict`.
+- Admins can never add or remove admins/owners (no privilege escalation).
+
+### Design decisions
+
+- **Outsiders get 404, not 403.** Querysets are filtered by membership, so a
+  project the user does not belong to is indistinguishable from a missing one.
+- **Uniqueness is enforced by the database.** `UniqueConstraint(project, user)`
+  and the unique phone number are the source of truth. The code catches
+  `IntegrityError` and returns `400` instead of relying on check-then-insert,
+  which is racy under concurrent requests.
+- **Last-owner check is race-free.** Member removal locks the project row
+  (`SELECT ... FOR UPDATE`) inside a transaction, so two owners removing each
+  other at the same time are serialized.
+- **Phone numbers are normalized once** to `09XXXXXXXXX` (serializer, manager
+  and `save()`), which is what makes the uniqueness constraint meaningful.
+
+## Tests
+
+```bash
+python manage.py test
+```
+
+`ConcurrentOwnerRemovalTests` uses real threads and needs PostgreSQL.
