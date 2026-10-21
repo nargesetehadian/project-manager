@@ -83,3 +83,23 @@ python manage.py test
 ```
 
 `ConcurrentOwnerRemovalTests` uses real threads and needs PostgreSQL.
+
+## Architecture
+
+```
+views.py        HTTP only: parse request, call service, build response
+services.py     business rules and transactions (add/remove member, create project)
+roles.py        role ranking: one rule, can_manage(actor, target)
+permissions.py  project-level access, reads the annotated my_role
+```
+
+- **One role rule.** Owner can manage everyone; any other role can manage only
+  strictly lower roles. Admin -> member, member -> nobody. No scattered
+  `if role in (...)` checks.
+- **No N+1.** `projects_for_user` joins only my membership row and annotates
+  `my_role`; serializer and permission reuse it with zero extra queries.
+  Tests assert the query count does not grow with the number of rows.
+- **Authorize before validate.** Non-managers get 403 before any input
+  validation, so they cannot probe which phone numbers are registered.
+- **Pagination.** List endpoints return `{count, next, previous, results}`
+  (page size 20) with a deterministic ordering.
